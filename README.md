@@ -1,6 +1,6 @@
 # Investigating Tokio I/O responsiveness
 
-We think Tokio to hold this invariant:
+I (we?) think Tokio to hold this invariant:
 - Either **all tasks are busy**, actively working on Futures; or
 - **A thread is blocked on I/O**, ready to respond immediately as new work arrives.
 
@@ -96,7 +96,7 @@ This can lead to a situation where, with HTTP/1.1, new work gets ignored:
 
 ## Bigger problems?
 
-Per discussion with @aturon:
+From discussion with @aturon:
 
 If all threads are idle, Tokio performs a blocking `epoll` call to wait for new work.
 If there's new work, that thread might handle it... but it won't necessarily wake other threads until it's done with its work.

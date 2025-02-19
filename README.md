@@ -30,6 +30,8 @@ I reproduced this in this repository. Run `cargo run --bin original`, open `loca
 
 The program starts up an Axum webserver, backed by a Tokio pool with four workers.
 
+### Browser
+
 The page loads five images; each of which is constrained to take two seconds to "render"
 (really, just sleeps). The web browser dispatches all the requests at the same time.
 
@@ -61,6 +63,35 @@ Once that is done, the server wakes additional threads and starts processing:
 2025-02-18T20:04:32.846262Z  INFO original: starting image: 4
 2025-02-18T20:04:32.846343Z  INFO original: starting image: 2
 ```
+
+### Client
+
+`client_http1` reproduces the issue.
+
+- The client connects (with one connection) and sends a first request.
+- Once that request is complete, the client sends five more requests:
+  - One on the existing (open) connection
+  - Four by creating new connections and sending the request
+
+The results:
+
+```
+starting prewarm request...
+prewarm done
+query 0: 2001
+query 1: 4002
+query 2: 4002
+query 3: 4002
+query 4: 4002
+```
+
+This behavior is observed with `multi_thread` and `single_thread` Tokio executors on the client side.
+
+### Non-reproductions
+
+-   An earlier version of `client_http1` made all the connections serially, then made all the requests.
+    This was not subject to the queueing at issue here -- the first four requests all completed in ~2 seconds, as expected with a 4-worker server.
+-   `client_http2`, which multiplexes all the requests on the same HTTP/2 stream, does not reproduce this behavior.
 
 ## What's going on?
 
@@ -253,19 +284,6 @@ Oddly, `park_timeout` asserts that the duration is 0 (!) for this path.
 
 `Inner::park` checks if already notified (in which case, it returns regardless).
 Then, attempts to lock the I/O driver, and either parks on the driver, or parks on a condition variable.
-
-
-# Reproduction
-
-I wrote `client_http2` and `client_http2` in attempts to reproduce this.
-(Note that since I'm running on `localhost`, the browser is using HTTP/1.1.)
-
-No dice: each of them has the ~expected-ideal behavior, 2s for the first four responses (full concurrency) and 4s for the last.
-
-What's different between the browser & these clients? Some possibilities:
-- Connection re-use, between the first request & the others.
-  There's a different "wake" ordering for HTTP/1.1 in terms of what tasks need to be scheduled to complete the work.
-
 
 # Speculation
 

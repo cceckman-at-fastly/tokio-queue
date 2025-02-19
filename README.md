@@ -255,14 +255,19 @@ Oddly, `park_timeout` asserts that the duration is 0 (!) for this path.
 Then, attempts to lock the I/O driver, and either parks on the driver, or parks on a condition variable.
 
 
+# Reproduction
+
+I wrote `client_http2` and `client_http2` in attempts to reproduce this.
+(Note that since I'm running on `localhost`, the browser is using HTTP/1.1.)
+
+No dice: each of them has the ~expected-ideal behavior, 2s for the first four responses (full concurrency) and 4s for the last.
+
+What's different between the browser & these clients? Some possibilities:
+- Connection re-use, between the first request & the others.
+  There's a different "wake" ordering for HTTP/1.1 in terms of what tasks need to be scheduled to complete the work.
 
 
-
-
-
-
-
-
+# Speculation
 
 When does Tokio wake a previously-idle thread?
 

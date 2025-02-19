@@ -62,7 +62,207 @@ Once that is done, the server wakes additional threads and starts processing:
 2025-02-18T20:04:32.846343Z  INFO original: starting image: 2
 ```
 
-## Tokio idleness
+## What's going on?
+
+Let's start with the `TcpListener`, as that's where the request comes in.
+It implements an `async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)>`,
+i.e. a point at which a future can `await` a new TCP connection.
+
+It is passed to `axum::serve`, which eventually winds up as a future in
+`axum::serve::WithGracefulShutdown::into_future`. The inner `ServeFuture` there
+repeatedly:
+
+1.  Awaits `listener.accept()`, and maps it to a common I/O trait
+2.  Makes a new `TowerToHyperService` for the conection
+3.  `tokio::spawn`s a new task
+
+    In that task, it connects the I/O and Hyper service (`builder`) and runs them;
+    the combined object is a future that runs all requests for the connection.
+
+Some observations:
+
+- There may be at most two tasks runnable at any time.
+  If no second connection comes through, the accepter thread may be slept
+  awaiting the socket to be readable; we may wind up with only one runnable task.
+
+
+## `block_on`
+
+Let's look more deeply at how Tokio will handle scheduling.
+
+We created a `Runtime` to begin with and called `block_on`, which notes:
+
+> This runs the given future on the current thread, blocking until it is
+> complete, and yielding its resolved result. Any tasks or timers
+> which the future spawns internally will be executed on the runtime.
+> ...
+> When the multi thread scheduler is used this will allow futures
+> to run within the io driver and timer context of the overall runtime.
+> Any spawned tasks will continue running after `block_on` returns.
+
+So, this particular future -- the one `accept`ing -- will run on the current thread.
+Other futures *may* run on other threads. (Will this future not get rescheduled to another thread?
+There's no `Send` constraint on the future -- so, I guess not.)
+
+Might that be the problem? Once this thread "decides" to run on the local thread,
+if the local thread starts picking up other work -- e.g. HTTP responses --
+the `accept`ing thread won't run any more? Let's try, with the example in `spawn_pool.rs`:
+we'll `spawn` the `serve` future (which requires it be `Send`) to allow it to migrate
+around the pool.
+
+Still, no dice! Same behavior as before.
+
+## `spawn`
+
+What hapens to that spawned future?
+
+IN this case, it winds up going down to `tokio::runtime::scheduler::multi_thread::Handle::bind_new_task`.
+That does three calls:
+- `worker::OwnedTasks::bind`, generating the `JoinHandle`; this is an executor-wide database.
+  `OwnedTasks::bind` also calls to `runtime::task::new_task`, where the `Task` structure is created.
+- `TaskHooks::spawn`, providing just the task ID
+  This invokes - some sort of callback. It looks like they're meant to be user-provided, but can't be today.
+
+- `Handle::schedule_option_task_without_yield`
+
+  This in turn calls `Handle::schedule_task`, if the task was "notified" to begin with
+  (Not sure what that means; "already ready to run"? See `new_task`.)
+
+`schedule_task` is where the magic happens. Its logic:
+
+```rust
+            if let Some(cx) = maybe_cx {
+                // Make sure the task is part of the **current** scheduler.
+                if self.ptr_eq(&cx.worker.handle) {
+                    // And the current thread still holds a core
+                    if let Some(core) = cx.core.borrow_mut().as_mut() {
+                        self.schedule_local(core, task, is_yield);
+                        return;
+                    }
+                }
+            }
+
+            // Otherwise, use the inject queue.
+            self.push_remote_task(task);
+            self.notify_parked_remote();
+```
+
+"If the current thread holds a core" (i.e. has claimed a worker state), `schedule_local`;
+otherwise, push to the global queue and notify parked remotes.
+I guess this is what lets us `spawn` from outside the runtime- the current thread won't have a core.
+
+In cases where the LIFO queue is not used (including when it is already full),
+`schedule_local` will `push_back_or_overflow` into the local `run_queue`, which marks `should_notify`.
+
+If `should_notify` (i.e. there is a task in our queue) and a `Parker` is available on the `Core`, it then calls `notify_parked_local`.
+That picks an `idle.worker_to_notify` and unparks it.
+
+This `schedule_local` code includes this comment before notifying:
+
+```rust
+        // Only notify if not currently parked. If `park` is `None`, then the
+        // scheduling is from a resource driver. As notifications often come in
+        // batches, the notification is delayed until the park is complete.
+        if should_notify && core.park.is_some() {
+            self.notify_parked_local();
+        }
+```
+
+- [ ] I'm not sure I understand that.
+
+## More stuff to understand
+
+`is_searching` state in `Worker`.
+
+Let's start from `run(Arc<Worker>)`.
+1.  Try to get a `core`; exit if you can't claim it.
+    So: for everything else, assume we have a `core`.
+2.  Create a multi-threaded handle.
+3.  `enter_runtime(handle, allow_block_in_place: true, closure)`, which:
+    1.  Checks that we aren't yet part of a runtime, via the `CONTEXT` TLS
+    2.  Creates an EnterRuntimeGuard
+    3.  In the closure, creates a new scheduler context
+    4.  In the closure, `set_scheduler`, which binds that new scheduler context to the `CONTEXT`
+    5.  Runs `Context::run(core)` with that thread-local state set
+    6.  On exit, may wake deferred tasks (?) in the scheduler context.
+4.  `Context::run(core)`:
+    ...now we're getting somewhere?
+
+    Loops around "not shutdown";
+    1.  Ticks
+    2.  Performs maintenance, on every N ticks:
+
+        > "Enables the i/O driver, timer, ... to run without actually putting the thread to sleep"
+
+        So `Context::park_timeout` includes invoking the event-trigger checks?
+        - [ ] Read it later
+
+        Internal "Run scheduled maintenance"; update shutdown, update tracing, publish stats.
+        Stuff that requires cross-thread locks, I guess?
+    3.  Look for the next local task: `Core::next_task`
+        1.  On a "global queue interval", retune that same interval...
+            and take a task from the global queue, if available.
+
+            - [ ] Checking understanding: this is to ensure that the global queue is eventually drained.
+              If all the threads remain busy with their local work, we could conceivably be in a place
+              where stuff in the global queue never gets drained.
+
+        2.  Take a local task, if one is available.
+        3.  Pull from the injection queue, if available, into our local queue.
+
+            - [ ] When does work go into the injection queue?
+    4.  If there is no local work, or work in the injection queue, or work in the global queue,
+        `Core::steal_work`.
+
+        1.  `transition_to_searching`. This involves synchronizing on a couple of atomics,
+            in an attempt to limit the number of workers searching at a time.
+
+            This may fail (say "no you shouldn't be searching"), in which case the thread remains with no work.
+        2.  For up to the total number of workers, attempt to steal (half the tasks) from one of them
+            with `Steal::Steal_into`.
+        3.  Failing that, take from the global queue (`next_remote_task`).
+    5.  If there is no global work either,
+        if `Context::defer` is empty, `park`; otherwise, `park_timeout` with a timeout of 0.
+
+        `Core::defer` is a queue(?) in the local context that has
+        "Tasks to wake after resource drivers are polled. This is mostly to handle yielded tasks."
+
+
+### Parking
+
+Two entry points: `Context::park` and `Context::park_timeout`. `park` has this note:
+
+```rust
+    /// This function checks if indeed there's no more work left to be done before parking.
+    /// Also important to notice that, before parking, the worker thread will try to take
+    /// ownership of the Driver (IO/Time) and dispatch any events that might have fired.
+    /// Whenever a worker thread executes the Driver loop, all waken tasks are scheduled
+    /// in its own local queue until the queue saturates (ntasks > `LOCAL_QUEUE_CAPACITY`).
+    /// When the local queue is saturated, the overflow tasks are added to the injection queue
+    /// from where other workers can pick them up.
+    /// Also, we rely on the workstealing algorithm to spread the tasks amongst workers
+    /// after all the IOs get dispatched
+```
+
+This doesn't apear to happen for `park_timeout`, i.e. if there are already "to wake after I/O driver tasks"--
+presumably because `park_timeout` completes immediately, and we know those threads will be waked.
+
+The actual call to "try the driver" is in `Parker::park_timeout`: `self.inner.shared.driver.try_lock()`.
+
+Oddly, `park_timeout` asserts that the duration is 0 (!) for this path.
+
+`Inner::park` checks if already notified (in which case, it returns regardless).
+Then, attempts to lock the I/O driver, and either parks on the driver, or parks on a condition variable.
+
+
+
+
+
+
+
+
+
+
 
 When does Tokio wake a previously-idle thread?
 
